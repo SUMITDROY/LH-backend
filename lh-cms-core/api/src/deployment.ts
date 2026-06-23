@@ -1,0 +1,96 @@
+import type { Credentials, Options, ProviderType } from '@directus/types';
+import getDatabase from './database/index.js';
+import type { DeploymentDriver } from './deployment/deployment.js';
+import { CloudflareDriver, NetlifyDriver, VercelDriver } from './deployment/drivers/index.js';
+import { useLogger } from './logger/index.js';
+import { DeploymentService } from './services/deployment.js';
+import { getSchema } from './utils/get-schema.js';
+
+// Driver constructor type — `any` for credentials/options so provider-specific subclasses (e.g. required CloudflareOptions) are assignable
+type DriverConstructor = new (credentials: any, options?: any) => DeploymentDriver;
+
+/**
+ * Registry of deployment driver constructors
+ */
+const drivers: Map<ProviderType, DriverConstructor> = new Map();
+
+/**
+ * Register all deployment drivers
+ */
+export function registerDeploymentDrivers(): void {
+	drivers.set('vercel', VercelDriver);
+	drivers.set('netlify', NetlifyDriver);
+	drivers.set('cloudflare-workers', CloudflareDriver);
+}
+
+/**
+ * Get a deployment driver instance
+ *
+ * @param provider Provider name (vercel, netlify, aws, etc.)
+ * @param credentials Provider credentials (decrypted from DB)
+ * @param options Additional provider options
+ * @returns Deployment driver instance
+ * @throws Error if provider is not supported
+ */
+export function getDeploymentDriver(
+	provider: ProviderType,
+	credentials: Credentials,
+	options?: Options,
+): DeploymentDriver {
+	const Driver = drivers.get(provider);
+
+	if (!Driver) {
+		throw new Error(`Deployment driver "${provider}" is not supported`);
+	}
+
+	return new Driver(credentials, options);
+}
+
+/**
+ * Check if a provider is supported
+ */
+export function isValidProviderType(provider: string): provider is ProviderType {
+	return drivers.has(provider as ProviderType);
+}
+
+/**
+ * Get list of supported provider types
+ */
+export function getSupportedProviderTypes(): ProviderType[] {
+	return Array.from(drivers.keys());
+}
+
+/**
+ * Sync webhooks for existing deployment configs that don't have one yet.
+ * Called at startup to handle configs created before webhook support was added.
+ */
+export async function ensureDeploymentWebhooks(): Promise<void> {
+	const logger = useLogger();
+	const knex = getDatabase();
+	const schema = await getSchema();
+
+	const service = new DeploymentService({
+		knex,
+		schema,
+		accountability: null,
+	});
+
+	const configs = await service.readByQuery({
+		limit: -1,
+	});
+
+	if (!configs || configs.length === 0) {
+		logger.debug('[webhook] No deployment configs found');
+		return;
+	}
+
+	logger.debug(`[webhook] Syncing webhooks for ${configs.length} config(s)...`);
+
+	for (const config of configs) {
+		try {
+			await service.syncWebhook(config.provider);
+		} catch (err) {
+			logger.error(`[webhook] Failed to sync webhook for ${config.provider}: ${err}`);
+		}
+	}
+}
